@@ -6,6 +6,8 @@ import boto3
 import csv
 from io import StringIO
 import json
+from boto3.dynamodb.conditions import Key
+from decimal import Decimal
 
 def search_yahoo_items(application_id, query, sort='-score', hits=10, start=1, price_from=None, price_to=None, seller_id=None, retries=3):
     """
@@ -100,43 +102,92 @@ def is_single_character(word):
     """
     return len(word) == 1
 
-def load_notified_list(s3_client, bucket, key):
+def load_notified_list_from_dynamodb(dynamodb_resource, table_name):
     """
-    S3から通知済みリストを読み込む関数。
-    存在しない場合は空のセットを返す。
+    DynamoDBから通知済みリストを読み込む関数。
+    テーブルが存在しない場合は空のセットを返す。
     """
     try:
-        response = s3_client.get_object(Bucket=bucket, Key=key)
-        content = response['Body'].read().decode('utf-8')
-        df = pd.read_csv(StringIO(content))
-        notified_set = set(df['itemUrl'].tolist())
-        print(f"通知済みリストをロードしました。総アイテム数: {len(notified_set)}")
+        table = dynamodb_resource.Table(table_name)
+        
+        # 全件スキャンして通知済みURLを取得
+        notified_set = set()
+        response = table.scan()
+        
+        for item in response.get('Items', []):
+            notified_set.add(item['itemUrl'])
+        
+        # ページングがある場合は続きを取得
+        while 'LastEvaluatedKey' in response:
+            response = table.scan(ExclusiveStartKey=response['LastEvaluatedKey'])
+            for item in response.get('Items', []):
+                notified_set.add(item['itemUrl'])
+        
+        print(f"通知済みリストをDynamoDBからロードしました。総アイテム数: {len(notified_set)}")
         return notified_set
-    except s3_client.exceptions.NoSuchKey:
-        print("notifiedlist.csvが存在しません。新規に作成します。")
+        
+    except dynamodb_resource.meta.client.exceptions.ResourceNotFoundException:
+        print(f"DynamoDBテーブル '{table_name}' が存在しません。新規に作成します。")
+        # テーブルを作成
+        try:
+            table = dynamodb_resource.create_table(
+                TableName=table_name,
+                KeySchema=[
+                    {
+                        'AttributeName': 'itemUrl',
+                        'KeyType': 'HASH'  # Partition key
+                    }
+                ],
+                AttributeDefinitions=[
+                    {
+                        'AttributeName': 'itemUrl',
+                        'AttributeType': 'S'
+                    }
+                ],
+                BillingMode='PAY_PER_REQUEST'  # オンデマンド課金
+            )
+            # テーブルが作成されるまで待機
+            table.wait_until_exists()
+            print(f"DynamoDBテーブル '{table_name}' を作成しました。")
+        except Exception as e:
+            print(f"DynamoDBテーブルの作成中にエラーが発生しました: {e}")
+        
         return set()
     except Exception as e:
-        print(f"notifiedlist.csvの読み込み中にエラーが発生しました: {e}")
+        print(f"DynamoDBからの読み込み中にエラーが発生しました: {e}")
         return set()
 
-def save_notified_list(s3_client, bucket, key, notified_set):
+def save_to_dynamodb(dynamodb_resource, table_name, new_urls):
     """
-    通知済みリストをS3に保存する関数。
+    新しいURLをDynamoDBに追加する関数。
     """
-    df = pd.DataFrame({'itemUrl': list(notified_set)})
-    csv_buffer = StringIO()
-    df.to_csv(csv_buffer, index=False)
+    if not new_urls:
+        return
+    
     try:
-        s3_client.put_object(Bucket=bucket, Key=key, Body=csv_buffer.getvalue())
-        print(f"通知済みリストをS3に保存しました。総アイテム数: {len(notified_set)}")
+        table = dynamodb_resource.Table(table_name)
+        
+        # バッチ書き込みで効率的に追加
+        with table.batch_writer() as batch:
+            for url in new_urls:
+                batch.put_item(
+                    Item={
+                        'itemUrl': url,
+                        'notifiedAt': int(time.time())  # 通知日時をUnixタイムスタンプで記録
+                    }
+                )
+        
+        print(f"DynamoDBに {len(new_urls)} 件の新規URLを追加しました。")
     except Exception as e:
-        print(f"notifiedlist.csvの保存中にエラーが発生しました: {e}")
+        print(f"DynamoDBへの保存中にエラーが発生しました: {e}")
 
-def search_and_notify(config_data, application_id, chatwork_room_id, chatwork_api_token, notified_set):
+def search_and_notify(config_data, application_id, chatwork_room_id, chatwork_api_token, notified_set, dynamodb_resource, table_name):
     """
     Yahoo!ショッピングAPIを使用して商品を検索し、条件に応じてチャットワークに通知する関数。
     通知後、通知済みリストに追加します。
     """
+    new_notified_urls = []  # このバッチで新たに通知したURL
+    
     # CSVの各行に対して処理を行う
     for index, row in config_data.iterrows():
         # 行番号をログとして表示
@@ -267,6 +318,7 @@ def search_and_notify(config_data, application_id, chatwork_room_id, chatwork_ap
                     if success:
                         # 通知済みリストに追加
                         notified_set.add(item_url)
+                        new_notified_urls.append(item_url)
                         print(f"商品 '{item_name}' を通知済みリストに追加しました。")
                     else:
                         print(f"行 {index + 1} の商品 '{item_name}' の通知送信に失敗しました。")
@@ -278,6 +330,10 @@ def search_and_notify(config_data, application_id, chatwork_room_id, chatwork_ap
         
         # 次の行に進む前に少し待機（必要に応じて調整）
         # time.sleep(1)
+    
+    # 新しく通知したURLをDynamoDBに保存
+    if new_notified_urls:
+        save_to_dynamodb(dynamodb_resource, table_name, new_notified_urls)
     
     return notified_set
 
@@ -292,12 +348,14 @@ def lambda_handler(event, context):
     chatwork_api_token = os.getenv('CHATWORK_API_TOKEN', '2f92f7d4409ac2726c716fc0513fadc1')
     config_s3_bucket = os.getenv('CONFIG_S3_BUCKET', 'config-csv')
     config_s3_key = os.getenv('CONFIG_S3_KEY', 'config.csv')
-    notified_s3_bucket = 'yahoo--notifiedlist--2'
-    notified_s3_key = 'notifiedlist.csv'
+    dynamodb_table_name = os.getenv('DYNAMODB_TABLE_NAME', 'yahoo-notifiedlist-2')
     batch_size = int(os.getenv('BATCH_SIZE', '100'))
     
     # S3クライアントの作成
     s3 = boto3.client('s3')
+    
+    # DynamoDBリソースの作成
+    dynamodb = boto3.resource('dynamodb')
     
     # イベントから現在のバッチ番号を取得（デフォルトは0）
     current_batch = event.get('current_batch', 0)
@@ -327,14 +385,14 @@ def lambda_handler(event, context):
     batch_data = config_data.iloc[start_index:end_index]
     print(f"処理するバッチ番号: {current_batch + 1} / {total_batches} (行 {start_index + 1} から {min(end_index, len(config_data))} )")
     
-    # 通知済みリストをS3から読み込む
-    notified_set = load_notified_list(s3, notified_s3_bucket, notified_s3_key)
+    # 通知済みリストをDynamoDBから読み込む
+    notified_set = load_notified_list_from_dynamodb(dynamodb, dynamodb_table_name)
     
     # 商品を検索して通知
-    updated_notified_set = search_and_notify(batch_data, application_id, chatwork_room_id, chatwork_api_token, notified_set)
-    
-    # 更新された通知済みリストをS3に保存する
-    save_notified_list(s3, notified_s3_bucket, notified_s3_key, updated_notified_set)
+    updated_notified_set = search_and_notify(
+        batch_data, application_id, chatwork_room_id, chatwork_api_token, 
+        notified_set, dynamodb, dynamodb_table_name
+    )
     
     # 次のバッチが存在する場合は、次のバッチを処理するためにLambdaを再呼び出し
     if current_batch + 1 < total_batches:
