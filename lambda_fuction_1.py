@@ -35,11 +35,11 @@ def search_yahoo_items(application_id, query, sort='-score', hits=10, start=1, p
     for attempt in range(retries):
         try:
             print(f"APIリクエスト: query='{query}', price_from={price_from}, price_to={price_to}")
-            time.sleep(1)  # Yahoo APIのレート制限に応じた待機時間（1クエリー/秒）
 
             response = requests.get(base_url, params=params)
 
             if response.status_code == 200:
+                time.sleep(1)  # Yahoo APIのレート制限に応じた待機時間（1クエリー/秒）
                 return response.json()
             elif response.status_code == 400:
                 print(f"Error: {response.status_code}")
