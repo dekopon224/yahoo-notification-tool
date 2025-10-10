@@ -8,6 +8,87 @@ from io import StringIO
 import json
 from boto3.dynamodb.conditions import Key
 from decimal import Decimal
+from google.oauth2 import service_account
+from googleapiclient.discovery import build
+from googleapiclient.errors import HttpError
+
+def get_google_credentials_from_secrets_manager(secret_name, region_name='us-east-2'):
+    """
+    AWS Secrets ManagerからGoogle認証情報を取得する関数
+    """
+    session = boto3.session.Session()
+    client = session.client(
+        service_name='secretsmanager',
+        region_name=region_name
+    )
+
+    try:
+        get_secret_value_response = client.get_secret_value(
+            SecretId=secret_name
+        )
+        secret = get_secret_value_response['SecretString']
+        credentials_info = json.loads(secret)
+
+        # サービスアカウント認証情報を作成
+        credentials = service_account.Credentials.from_service_account_info(
+            credentials_info,
+            scopes=['https://www.googleapis.com/auth/spreadsheets.readonly']
+        )
+        return credentials
+    except Exception as e:
+        print(f"Secrets Managerから認証情報を取得できませんでした: {e}")
+        raise e
+
+def get_excluded_shops_from_sheets(credentials, spreadsheet_id, sheet_name='除外店舗_Yahoo'):
+    """
+    Google SheetsのA列2行目から空のセルまでの除外店舗リストを取得する関数
+
+    Args:
+        credentials: Google認証情報
+        spreadsheet_id: スプレッドシートID
+        sheet_name: シート名（デフォルト: '除外店舗_Yahoo'）
+
+    Returns:
+        list: 除外店舗名のリスト（小文字化済み）
+    """
+    try:
+        # Google Sheets APIサービスを構築
+        service = build('sheets', 'v4', credentials=credentials)
+
+        # A列の2行目から取得（シート名を指定）
+        range_name = f'{sheet_name}!A2:A'
+        sheet = service.spreadsheets()
+        result = sheet.values().get(
+            spreadsheetId=spreadsheet_id,
+            range=range_name
+        ).execute()
+
+        values = result.get('values', [])
+
+        if not values:
+            print('除外店舗リストが空です')
+            return []
+
+        # 店舗名のリストを作成（空のセルまで処理）
+        excluded_shops = []
+        for row in values:
+            if not row or not row[0]:  # 空のセルに到達したら終了
+                break
+            shop_name = str(row[0]).strip().lower()
+            if shop_name:  # 空文字列でない場合のみ追加
+                excluded_shops.append(shop_name)
+
+        print(f"Google Sheetsから{len(excluded_shops)}件の除外店舗を取得しました")
+        print(f"除外店舗リスト（最初の10件）: {excluded_shops[:10]}")
+
+        return excluded_shops
+
+    except HttpError as error:
+        print(f'Google Sheets APIエラーが発生しました: {error}')
+        return []
+    except Exception as e:
+        print(f'除外店舗リストの取得中にエラーが発生しました: {e}')
+        return []
 
 def search_yahoo_items(application_id, query, sort='-score', hits=10, start=1, price_from=None, price_to=None, seller_id=None, retries=3):
     """
@@ -182,18 +263,18 @@ def save_to_dynamodb(dynamodb_resource, table_name, new_urls):
     except Exception as e:
         print(f"DynamoDBへの保存中にエラーが発生しました: {e}")
 
-def search_and_notify(config_data, application_id, chatwork_room_id, chatwork_api_token, notified_set, dynamodb_resource, table_name):
+def search_and_notify(config_data, application_id, chatwork_room_id, chatwork_api_token, notified_set, dynamodb_resource, table_name, global_excluded_shops):
     """
     Yahoo!ショッピングAPIを使用して商品を検索し、条件に応じてチャットワークに通知する関数。
     通知後、通知済みリストに追加します。
     """
     new_notified_urls = []  # このバッチで新たに通知したURL
-    
+
     # CSVの各行に対して処理を行う
     for index, row in config_data.iterrows():
         # 行番号をログとして表示
         print(f"現在 {index + 1} 行目を処理しています。")
-        
+
         original_keyword = str(row['product_keyword']).strip()
         ng_keyword = str(row['ng_keyword']).strip() if pd.notna(row['ng_keyword']) else None
         min_price = row['lowest_price'] if pd.notna(row['lowest_price']) else None
@@ -204,9 +285,13 @@ def search_and_notify(config_data, application_id, chatwork_room_id, chatwork_ap
         if sellerIdExs_raw.lower() != 'nan':
             sellerIdExs = sellerIdExs_raw.strip('"')  # ダブルクォーテーションを除去
             excluded_shops = [shop.strip().lower() for shop in sellerIdExs.split(',')]
-            print(f"除外店舗リスト: {excluded_shops}")
+            print(f"CSV除外店舗リスト: {excluded_shops}")
         else:
             excluded_shops = []
+
+        # グローバル除外店舗とCSV除外店舗を統合
+        all_excluded_shops = set(global_excluded_shops + excluded_shops)
+        print(f"統合除外店舗数: {len(all_excluded_shops)}")
 
         # キーワードが空でないか確認
         if not original_keyword:
@@ -265,8 +350,8 @@ def search_and_notify(config_data, application_id, chatwork_room_id, chatwork_ap
                 item_url = item['url']
                 shop_name = item.get('seller', {}).get('name', '不明').strip().lower()  # 店舗名を取得し、小文字化
 
-                # 除外店舗のチェック
-                if shop_name in excluded_shops:
+                # 統合除外店舗リストでチェック
+                if shop_name in all_excluded_shops:
                     print(f"商品 '{item_name}' は除外店舗 '{shop_name}' のため通知しません。")
                     continue
 
@@ -351,15 +436,58 @@ def lambda_handler(event, context):
     config_s3_key = os.getenv('CONFIG_S3_KEY', 'config.csv')
     dynamodb_table_name = os.getenv('DYNAMODB_TABLE_NAME', 'yahoo-notifiedlist-1')
     batch_size = int(os.getenv('BATCH_SIZE', '100'))
-    
+
+    # Google Sheets関連の環境変数
+    google_secret_name = os.getenv('GOOGLE_SECRET_NAME')  # Secrets Managerのシークレット名
+    spreadsheet_id = os.getenv('SPREADSHEET_ID')  # スプレッドシートID
+
     # S3クライアントの作成
     s3 = boto3.client('s3')
-    
+
     # DynamoDBリソースの作成
     dynamodb = boto3.resource('dynamodb')
-    
+
     # イベントから現在のバッチ番号を取得（デフォルトは0）
     current_batch = event.get('current_batch', 0)
+
+    # バッチ0の場合のみGoogle Sheetsから除外店舗リストを取得
+    global_excluded_shops = []
+    if current_batch == 0:
+        try:
+            print("Google Sheetsから除外店舗リストを取得中...")
+            # Secrets Managerから認証情報を取得
+            if google_secret_name and spreadsheet_id:
+                credentials = get_google_credentials_from_secrets_manager(google_secret_name)
+
+                # スプレッドシートから除外店舗リストを取得
+                global_excluded_shops = get_excluded_shops_from_sheets(
+                    credentials,
+                    spreadsheet_id,
+                    sheet_name='除外店舗_Yahoo'
+                )
+
+                # 取得した除外店舗リストをS3に保存（後続バッチで使用）
+                excluded_shops_data = json.dumps(global_excluded_shops)
+                s3.put_object(
+                    Bucket=config_s3_bucket,
+                    Key='temp_excluded_shops_yahoo.json',
+                    Body=excluded_shops_data
+                )
+                print(f"除外店舗リストをS3に一時保存しました（{len(global_excluded_shops)}件）")
+            else:
+                print("GOOGLE_SECRET_NAMEまたはSPREADSHEET_IDが設定されていません。スプレッドシートからの除外店舗取得をスキップします。")
+        except Exception as e:
+            print(f"Google Sheetsから除外店舗リストを取得できませんでした: {e}")
+            print("CSV内の除外店舗のみを使用します。")
+    else:
+        # バッチ0以外の場合はS3から除外店舗リストを読み込む
+        try:
+            response = s3.get_object(Bucket=config_s3_bucket, Key='temp_excluded_shops_yahoo.json')
+            global_excluded_shops = json.loads(response['Body'].read().decode('utf-8'))
+            print(f"S3から除外店舗リストを読み込みました（{len(global_excluded_shops)}件）")
+        except Exception as e:
+            print(f"S3から除外店舗リストを読み込めませんでした: {e}")
+            global_excluded_shops = []
     
     try:
         # S3からconfig.csvを取得
@@ -388,11 +516,11 @@ def lambda_handler(event, context):
     
     # 通知済みリストをDynamoDBから読み込む
     notified_set = load_notified_list_from_dynamodb(dynamodb, dynamodb_table_name)
-    
-    # 商品を検索して通知
+
+    # 商品を検索して通知（グローバル除外店舗リストを渡す）
     updated_notified_set = search_and_notify(
-        batch_data, application_id, chatwork_room_id, chatwork_api_token, 
-        notified_set, dynamodb, dynamodb_table_name
+        batch_data, application_id, chatwork_room_id, chatwork_api_token,
+        notified_set, dynamodb, dynamodb_table_name, global_excluded_shops
     )
     
     # 次のバッチが存在する場合は、次のバッチを処理するためにLambdaを再呼び出し
