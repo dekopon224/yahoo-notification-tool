@@ -20,7 +20,8 @@ def search_yahoo_items(application_id, query, sort='-score', hits=10, start=1, p
         'query': query,
         'sort': sort,
         'results': hits,
-        'start': start
+        'start': start,
+        'in_stock': 'true' # 在庫のある商品を検索
     }
 
     if price_from is not None:
