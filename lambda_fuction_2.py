@@ -90,9 +90,10 @@ def get_excluded_shops_from_sheets(credentials, spreadsheet_id, sheet_name='除�
         print(f'除外店舗リストの取得中にエラーが発生しました: {e}')
         return []
 
-def search_yahoo_items(application_id, query, sort='-score', hits=10, start=1, price_from=None, price_to=None, seller_id=None, retries=3):
+def search_yahoo_items(application_id, query, sort='-score', hits=10, start=1, price_from=None, price_to=None, seller_id=None, retries=5):
     """
     Yahoo!ショッピング商品検索APIを使用して、指定されたパラメータに基づいて商品情報を取得する関数。
+    レート制限: 1クエリー/秒
     """
     base_url = "https://shopping.yahooapis.jp/ShoppingWebService/V3/itemSearch"
 
@@ -116,29 +117,41 @@ def search_yahoo_items(application_id, query, sort='-score', hits=10, start=1, p
 
     for attempt in range(retries):
         try:
+            # リクエスト前に必ず1.5秒待機（レート制限対策）
+            if attempt > 0:
+                # リトライ時は段階的に待機時間を増やす（Exponential Backoff）
+                wait_time = min(2 ** attempt, 30)  # 最大30秒
+                print(f"リトライ前に{wait_time}秒待機します...")
+                time.sleep(wait_time)
+            else:
+                # 初回リクエスト前も1.5秒待機
+                time.sleep(1.5)
+
             print(f"APIリクエスト: query='{query}', price_from={price_from}, price_to={price_to}")
 
             response = requests.get(base_url, params=params)
 
             if response.status_code == 200:
-                time.sleep(1)  # Yahoo APIのレート制限に応じた待機時間（1クエリー/秒）
+                print("APIリクエスト成功")
                 return response.json()
             elif response.status_code == 400:
                 print(f"Error: {response.status_code}")
                 print(f"Response: {response.text}")
                 break  # 400エラーはクライアント側の問題なのでリトライしない
             elif response.status_code == 429:
-                print(f"Error: {response.status_code} - レート制限に達しました")
-                time.sleep(5)  # レート制限の場合は長めに待機
+                retry_after = int(response.headers.get('Retry-After', 10))
+                print(f"Error: {response.status_code} - レート制限に達しました。{retry_after}秒後にリトライします（試行 {attempt + 1}/{retries}）")
+                if attempt < retries - 1:
+                    time.sleep(retry_after)
             else:
                 print(f"Error: {response.status_code}")
                 print(f"Response: {response.text}")
         except requests.exceptions.RequestException as e:
             print(f"Request Exception: {e}")
+            if attempt < retries - 1:
+                time.sleep(3)
 
-        print(f"Retrying... ({attempt + 1}/{retries})")
-        time.sleep(2)  # 再試行前の待機時間
-
+    print(f"APIリクエストが{retries}回失敗しました。")
     return None
 
 def send_chatwork_notification(room_id, api_token, message, retries=3):
