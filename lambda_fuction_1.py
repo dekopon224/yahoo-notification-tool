@@ -39,55 +39,92 @@ def get_google_credentials_from_secrets_manager(secret_name, region_name='us-eas
         print(f"Secrets Managerから認証情報を取得できませんでした: {e}")
         raise e
 
-def get_excluded_shops_from_sheets(credentials, spreadsheet_id, sheet_name='除外店舗_Yahoo'):
+def get_excluded_shops_from_sheets(credentials, spreadsheet_id, sheet_name='除外店舗_Yahoo', s3_client=None, s3_bucket=None, max_retries=3):
     """
     Google SheetsのA列2行目から空のセルまでの除外店舗リストを取得する関数
+    リトライ処理とS3フォールバックを含む
 
     Args:
         credentials: Google認証情報
         spreadsheet_id: スプレッドシートID
         sheet_name: シート名（デフォルト: '除外店舗_Yahoo'）
+        s3_client: S3クライアント（フォールバック用、オプション）
+        s3_bucket: S3バケット名（フォールバック用、オプション）
+        max_retries: 最大リトライ回数（デフォルト: 3）
 
     Returns:
         list: 除外店舗名のリスト（小文字化済み）
     """
-    try:
-        # Google Sheets APIサービスを構築
-        service = build('sheets', 'v4', credentials=credentials)
+    # リトライ処理
+    for attempt in range(max_retries):
+        try:
+            # Google Sheets APIサービスを構築
+            service = build('sheets', 'v4', credentials=credentials)
 
-        # A列の2行目から取得（シート名を指定）
-        range_name = f'{sheet_name}!A2:A'
-        sheet = service.spreadsheets()
-        result = sheet.values().get(
-            spreadsheetId=spreadsheet_id,
-            range=range_name
-        ).execute()
+            # A列の2行目から取得（シート名を指定）
+            range_name = f'{sheet_name}!A2:A'
+            sheet = service.spreadsheets()
+            result = sheet.values().get(
+                spreadsheetId=spreadsheet_id,
+                range=range_name
+            ).execute()
 
-        values = result.get('values', [])
+            values = result.get('values', [])
 
-        if not values:
-            print('除外店舗リストが空です')
+            if not values:
+                print('除外店舗リストが空です')
+                return []
+
+            # 店舗名のリストを作成（空のセルまで処理）
+            excluded_shops = []
+            for row in values:
+                if not row or not row[0]:  # 空のセルに到達したら終了
+                    break
+                shop_name = str(row[0]).strip().lower()
+                if shop_name:  # 空文字列でない場合のみ追加
+                    excluded_shops.append(shop_name)
+
+            print(f"Google Sheetsから{len(excluded_shops)}件の除外店舗を取得しました")
+            print(f"除外店舗リスト（最初の10件）: {excluded_shops[:10]}")
+
+            return excluded_shops
+
+        except HttpError as error:
+            print(f'Google Sheets APIエラーが発生しました（試行 {attempt + 1}/{max_retries}）: {error}')
+            if attempt < max_retries - 1:
+                # 指数バックオフで待機（5秒、10秒、20秒）
+                wait_time = 5 * (2 ** attempt)
+                print(f"{wait_time}秒待機してリトライします...")
+                time.sleep(wait_time)
+            else:
+                print(f"{max_retries}回のリトライが全て失敗しました")
+        except Exception as e:
+            print(f'除外店舗リストの取得中にエラーが発生しました（試行 {attempt + 1}/{max_retries}）: {e}')
+            if attempt < max_retries - 1:
+                # 指数バックオフで待機（5秒、10秒、20秒）
+                wait_time = 5 * (2 ** attempt)
+                print(f"{wait_time}秒待機してリトライします...")
+                time.sleep(wait_time)
+            else:
+                print(f"{max_retries}回のリトライが全て失敗しました")
+
+    # 全てのリトライが失敗した場合、S3からフォールバック
+    if s3_client and s3_bucket:
+        try:
+            print("S3から既存の除外店舗リストを読み込みます（フォールバック）...")
+            response = s3_client.get_object(
+                Bucket=s3_bucket,
+                Key='temp_excluded_shops_yahoo.json'
+            )
+            excluded_shops = json.loads(response['Body'].read().decode('utf-8'))
+            print(f"S3から{len(excluded_shops)}件の除外店舗を取得しました（フォールバック使用）")
+            return excluded_shops
+        except Exception as s3_error:
+            print(f"S3からの除外店舗リスト読み込みに失敗しました: {s3_error}")
+            print("除外店舗リストを0件として処理します")
             return []
-
-        # 店舗名のリストを作成（空のセルまで処理）
-        excluded_shops = []
-        for row in values:
-            if not row or not row[0]:  # 空のセルに到達したら終了
-                break
-            shop_name = str(row[0]).strip().lower()
-            if shop_name:  # 空文字列でない場合のみ追加
-                excluded_shops.append(shop_name)
-
-        print(f"Google Sheetsから{len(excluded_shops)}件の除外店舗を取得しました")
-        print(f"除外店舗リスト（最初の10件）: {excluded_shops[:10]}")
-
-        return excluded_shops
-
-    except HttpError as error:
-        print(f'Google Sheets APIエラーが発生しました: {error}')
-        return []
-    except Exception as e:
-        print(f'除外店舗リストの取得中にエラーが発生しました: {e}')
+    else:
+        print("S3フォールバックが設定されていません。除外店舗リストを0件として処理します")
         return []
 
 def search_yahoo_items(application_id, query, sort='-score', hits=10, start=1, price_from=None, price_to=None, seller_id=None, retries=5):
@@ -472,14 +509,17 @@ def lambda_handler(event, context):
             if google_secret_name and spreadsheet_id:
                 credentials = get_google_credentials_from_secrets_manager(google_secret_name)
 
-                # スプレッドシートから除外店舗リストを取得
+                # スプレッドシートから除外店舗リストを取得（リトライとS3フォールバック付き）
                 global_excluded_shops = get_excluded_shops_from_sheets(
                     credentials,
                     spreadsheet_id,
-                    sheet_name='除外店舗_Yahoo'
+                    sheet_name='除外店舗_Yahoo',
+                    s3_client=s3,
+                    s3_bucket=config_s3_bucket
                 )
 
                 # 取得した除外店舗リストをS3に保存（後続バッチで使用）
+                # ただし、フォールバックで既存のS3データを取得した場合は上書きしない
                 excluded_shops_data = json.dumps(global_excluded_shops)
                 s3.put_object(
                     Bucket=config_s3_bucket,
